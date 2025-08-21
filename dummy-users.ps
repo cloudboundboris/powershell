@@ -1,0 +1,253 @@
+<# 
+.SYNOPSIS
+  Create N random AD users with realistic attributes.
+
+.EXAMPLE
+  .\New-RandomAdUsers.ps1 -OU "OU=Users,OU=NY,DC=example,DC=com" -Domain "example.com" -Count 15 -Company "Contoso" -Verbose
+
+.NOTES
+  Requires: RSAT ActiveDirectory module and rights to create users in the target OU.
+#>
+
+#Requires -Modules ActiveDirectory
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+  [Parameter(Mandatory=$true)]
+  [string]$OU,                                  # e.g. "OU=Users,DC=example,DC=com"
+
+  [Parameter(Mandatory=$true)]
+  [string]$Domain,                              # e.g. "example.com"
+
+  [int]$Count = 15,
+
+  [string]$Company = "Contoso",
+
+  [int]$PasswordLength = 14,
+
+  [switch]$PasswordNeverExpires = $false,
+
+  [switch]$DisableChangePasswordAtLogon        # default is to force change at logon
+)
+
+# ---------- Configurable sample data ----------
+
+$Departments = @(
+  "IT","HR","Finance","Operations","Sales","Marketing","Legal","R&D","Support","Security",
+  "Data","DevOps","Facilities","Procurement","Product","Engineering","QA","Customer Success"
+)
+$Titles = @(
+  "Analyst","Engineer","Senior Engineer","Systems Administrator","Helpdesk Specialist",
+  "Manager","Senior Manager","Director","Coordinator","Associate","Technician",
+  "Architect","Product Manager","Data Scientist","Security Analyst","DevOps Engineer"
+)
+# Office sites with addresses (physicalDeliveryOfficeName + postal address)
+$Offices = @(
+  @{ Office="NYC-01"; Street="200 5th Ave"; City="New York"; State="NY"; Postal="10010"; Country="US"; PhoneBase="+1-212-555" },
+  @{ Office="PA-01";  Street="100 Market St"; City="Philadelphia"; State="PA"; Postal="19106"; Country="US"; PhoneBase="+1-215-555" },
+  @{ Office="TX-01";  Street="600 Congress Ave"; City="Austin"; State="TX"; Postal="78701"; Country="US"; PhoneBase="+1-512-555" },
+  @{ Office="FL-01";  Street="50 Biscayne Blvd"; City="Miami"; State="FL"; Postal="33132"; Country="US"; PhoneBase="+1-305-555" }
+)
+
+# A decent pool of names for randomness
+$FirstNames = @(
+  "Ava","Olivia","Emma","Sophia","Isabella","Mia","Amelia","Harper","Evelyn","Abigail",
+  "Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander",
+  "Ethan","Mason","Michael","Sebastian","Jack","Jackson","Levi","Daniel","Mateo","Logan",
+  "Grace","Chloe","Luna","Camila","Layla","Aria","Scarlett","Penelope","Hazel","Nora"
+)
+$LastNames = @(
+  "Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez","Martinez",
+  "Hernandez","Lopez","Gonzalez","Wilson","Anderson","Thomas","Taylor","Moore","Jackson","Martin",
+  "Lee","Perez","Thompson","White","Harris","Sanchez","Clark","Ramirez","Lewis","Robinson",
+  "Walker","Young","Allen","King","Wright","Scott","Torres","Nguyen","Hill","Flores"
+)
+
+# Validate OU exists
+try {
+  $null = Get-ADOrganizationalUnit -Identity $OU -ErrorAction Stop
+} catch {
+  Throw "OU '$OU' not found or you lack permissions. Aborting."
+}
+
+# Utility: strong random password meeting complexity and length
+function New-StrongPassword {
+  param([int]$Length = 14)
+  if ($Length -lt 12) { $Length = 12 }
+
+  $upper = "ABCDEFGHJKLMNPQRSTUVWXYZ".ToCharArray()
+  $lower = "abcdefghijkmnopqrstuvwxyz".ToCharArray()
+  $digits = "23456789".ToCharArray()
+  $special = "!@#$%^&*-=+?".ToCharArray()
+
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+  function Pick([char[]]$set) {
+    $b = New-Object byte[] 4
+    $rng.GetBytes($b)
+    $idx = [BitConverter]::ToUInt32($b,0) % $set.Length
+    return $set[$idx]
+  }
+
+  # Ensure at least one of each category
+  $chars = New-Object System.Collections.Generic.List[char]
+  $chars.Add( (Pick $upper) )
+  $chars.Add( (Pick $lower) )
+  $chars.Add( (Pick $digits) )
+  $chars.Add( (Pick $special) )
+
+  $all = ($upper + $lower + $digits + $special)
+  while ($chars.Count -lt $Length) { $chars.Add( (Pick $all) ) }
+
+  # Shuffle
+  for ($i = 0; $i -lt $chars.Count; $i++) {
+    $b = New-Object byte[] 4
+    $rng.GetBytes($b)
+    $j = [BitConverter]::ToUInt32($b,0) % $chars.Count
+    $tmp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $tmp
+  }
+  -join $chars
+}
+
+# Utility: get unique samAccountName; fallback to suffix numbers
+function Get-UniqueSam {
+  param([string]$BaseSam)
+
+  $candidate = $BaseSam.ToLower()
+  $i = 0
+  while (Get-ADUser -LDAPFilter "(sAMAccountName=$candidate)" -ErrorAction SilentlyContinue) {
+    $i++
+    $candidate = ($BaseSam + $i).ToLower()
+  }
+  return $candidate
+}
+
+# Utility: safe phone generator
+function New-Phone {
+  param([string]$Base = "+1-212-555")
+  $rng = Get-Random -Minimum 1000 -Maximum 9999
+  return "$Base-$rng"
+}
+
+# Optionally pick a manager from already-created users (light hierarchy)
+$createdDNs = @()
+
+$results = New-Object System.Collections.Generic.List[pscustomobject]
+
+for ($n = 1; $n -le $Count; $n++) {
+
+  $First = Get-Random $FirstNames
+  $Last  = Get-Random $LastNames
+  $Dept  = Get-Random $Departments
+  $Title = Get-Random $Titles
+  $Site  = Get-Random $Offices
+
+  $DisplayName = "$First $Last"
+  $SamBase = ($First.Substring(0,1) + $Last) -replace "[^a-zA-Z0-9]",""
+  $Sam = Get-UniqueSam -BaseSam $SamBase
+  $UPN = "$Sam@$Domain"
+  $Mail = "$Sam@$Domain"
+
+  $EmpId = (Get-Random -Minimum 100000 -Maximum 999999).ToString()
+  $Phone = New-Phone -Base $Site.PhoneBase
+  $Mobile = New-Phone -Base "+1-917-555"
+  $Fax = New-Phone -Base "+1-646-555"
+
+  $PwdPlain = New-StrongPassword -Length $PasswordLength
+  $SecPwd = ConvertTo-SecureString $PwdPlain -AsPlainText -Force
+
+  $Name = $DisplayName
+  $CN = $Name
+
+  # Optionally assign a manager DN from previously created users ~30% of the time
+  $ManagerDN = $null
+  if ($createdDNs.Count -gt 0 -and (Get-Random -Minimum 0 -Maximum 100) -lt 30) {
+    $ManagerDN = Get-Random $createdDNs
+  }
+
+  $otherAttrs = @{
+    department                      = $Dept
+    title                           = $Title
+    company                         = $Company
+    employeeID                      = $EmpId
+    physicalDeliveryOfficeName      = $Site.Office
+    streetAddress                   = $Site.Street
+    l                               = $Site.City                 # City
+    st                              = $Site.State                # State
+    postalCode                      = $Site.Postal               # Zip
+    co                              = "United States"
+    c                               = $Site.Country
+    telephoneNumber                 = $Phone
+    mobile                          = $Mobile
+    facsimileTelephoneNumber        = $Fax
+    mail                            = $Mail
+  }
+
+  if ($PSCmdlet.ShouldProcess("$CN in $OU", "Create AD user")) {
+    try {
+      $params = @{
+        Name                  = $CN
+        GivenName             = $First
+        Surname               = $Last
+        DisplayName           = $DisplayName
+        SamAccountName        = $Sam
+        UserPrincipalName     = $UPN
+        Path                  = $OU
+        AccountPassword       = $SecPwd
+        Enabled               = $true
+        EmailAddress          = $Mail
+        ChangePasswordAtLogon = -not $DisableChangePasswordAtLogon
+        OtherAttributes       = $otherAttrs
+        ErrorAction           = 'Stop'
+      }
+
+      if ($PasswordNeverExpires) { $params['PasswordNeverExpires'] = $true }
+
+      New-ADUser @params
+
+      # Set manager after creation if selected
+      if ($ManagerDN) {
+        $u = Get-ADUser -Identity $Sam
+        Set-ADUser -Identity $u.DistinguishedName -Manager $ManagerDN
+      }
+
+      $dn = (Get-ADUser -Identity $Sam).DistinguishedName
+      $createdDNs += $dn
+
+      $results.Add([pscustomobject]@{
+        Name        = $DisplayName
+        sAMAccount  = $Sam
+        UPN         = $UPN
+        Email       = $Mail
+        Department  = $Dept
+        Title       = $Title
+        Office      = $Site.Office
+        Street      = $Site.Street
+        City        = $Site.City
+        State       = $Site.State
+        PostalCode  = $Site.Postal
+        Phone       = $Phone
+        Mobile      = $Mobile
+        ManagerDN   = $ManagerDN
+        EmployeeID  = $EmpId
+        TempPassword= $PwdPlain
+        DN          = $dn
+      })
+
+      Write-Verbose "Created $DisplayName ($Sam) in $OU"
+
+    } catch {
+      Write-Warning "Failed to create '$CN' : $($_.Exception.Message)"
+    }
+  }
+}
+
+# Export results
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outFile = Join-Path -Path (Get-Location) -ChildPath "CreatedUsers-$timestamp.csv"
+$results | Export-Csv -NoTypeInformation -Path $outFile -Encoding UTF8
+
+Write-Host "`nDone. Created $($results.Count) users. CSV: $outFile" -ForegroundColor Green
+if ($results.Count -lt $Count) {
+  Write-Host "Some users may have failed. Check warnings above." -ForegroundColor Yellow
+}
